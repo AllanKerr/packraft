@@ -3,12 +3,19 @@ package raft
 import (
 	"context"
 	"fmt"
+	"log"
+	"math/rand"
 	"net"
 	"time"
+
+	"github.com/allankerr/packraft/protos"
 )
 
 const (
 	tickDuration = time.Millisecond * 1
+
+	maxElectionTimeoutTicks = 1000
+	minElectionTimeoutTicks = 500
 )
 
 type LogEntry struct {
@@ -21,6 +28,9 @@ type tickMessage struct {
 
 type raftState struct {
 	serverID uint32
+	peers    []uint32
+	term     uint64
+	votedFor *uint32
 }
 
 func (rs *raftState) commit() {
@@ -53,6 +63,41 @@ type machineState struct {
 	requestHandlers  []RequestHandler
 	responseHandlers []ResponseHandler
 	messageHandlers  []MessageHandler
+
+	electionTimeoutTicks int
+	votes                int
+}
+
+func newFollowerState() *machineState {
+	state := new(machineState)
+	state.messageHandlers = []MessageHandler{
+		tickHandler{},
+	}
+	state.electionTimeoutTicks = randInt(minElectionTimeoutTicks, maxElectionTimeoutTicks)
+	return state
+}
+
+func newCandidateState(rs *raftState) *machineState {
+	state := new(machineState)
+	state.messageHandlers = []MessageHandler{
+		tickHandler{},
+	}
+	state.electionTimeoutTicks = randInt(minElectionTimeoutTicks, maxElectionTimeoutTicks)
+
+	rs.votedFor = &rs.serverID
+	rs.term += 1
+	return state
+}
+
+func newLeaderState(rs *raftState) *machineState {
+	state := new(machineState)
+	state.messageHandlers = []MessageHandler{
+		leaderTickHandler{},
+	}
+
+	rs.votedFor = nil
+	rs.term += 1
+	return state
 }
 
 type Raft struct {
@@ -80,8 +125,7 @@ func New(id uint32) *Raft {
 }
 
 func (r *Raft) Start(lis net.Listener) error {
-	// TODO: Create follower state
-	cur := new(machineState)
+	cur := newFollowerState()
 	go r.stateMachineLoop(cur)
 	return r.server.Serve(lis)
 }
@@ -157,4 +201,42 @@ func (rf *Raft) executeMessage(cur *machineState, msg interface{}) *machineState
 	rf.raftState.commit()
 	rf.client.Commit()
 	return next
+}
+
+type tickHandler struct {
+}
+
+func (h tickHandler) Execute(cur *machineState, rs *raftState, c *Client, msg interface{}) *machineState {
+
+	if _, ok := msg.(*tickMessage); !ok {
+		return nil
+	}
+	cur.electionTimeoutTicks--
+	if cur.electionTimeoutTicks != 0 {
+		return cur
+	}
+	if len(rs.peers) == 0 {
+		log.Println("become leader")
+		return newLeaderState(rs)
+	}
+	for _, peerID := range rs.peers {
+		req := protos.RequestVoteRequest{
+			Term:        rs.term,
+			CandidateId: rs.serverID,
+		}
+		res := protos.RequestVoteResponse{}
+		c.RequestVote(peerID, &req, &res)
+	}
+	return newCandidateState(rs)
+}
+
+type leaderTickHandler struct {
+}
+
+func (h leaderTickHandler) Execute(cur *machineState, rs *raftState, c *Client, msg interface{}) *machineState {
+	return cur
+}
+
+func randInt(min int, max int) int {
+	return rand.Intn(max-min+1) + min
 }
