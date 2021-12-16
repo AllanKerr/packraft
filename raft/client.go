@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"time"
 
 	"github.com/allankerr/packraft/protos"
 	"google.golang.org/grpc"
@@ -13,9 +14,12 @@ var (
 	ErrServerNotFound = status.Error(codes.InvalidArgument, "invalid server ID")
 )
 
+const (
+	defaultTimeout = time.Second
+)
+
 type request struct {
 	serverID uint32
-	ctx      context.Context
 	method   string
 	req      interface{}
 	res      interface{}
@@ -31,12 +35,14 @@ type Client struct {
 	responseCh chan IncomingResponseEnvelope
 	conns      map[uint32]*grpc.ClientConn
 	queue      []request
+	timeout    time.Duration
 }
 
 func NewClient(responseCh chan IncomingResponseEnvelope) *Client {
 	return &Client{
 		responseCh: responseCh,
 		conns:      make(map[uint32]*grpc.ClientConn),
+		timeout:    defaultTimeout,
 	}
 }
 
@@ -58,20 +64,18 @@ func (c *Client) Disconnect(serverID uint32) error {
 	return conn.Close()
 }
 
-func (c *Client) RequestVote(serverID uint32, ctx context.Context, in *protos.RequestVoteRequest, out *protos.RequestVoteResponse) {
+func (c *Client) RequestVote(serverID uint32, in *protos.RequestVoteRequest, out *protos.RequestVoteResponse) {
 	c.queue = append(c.queue, request{
 		serverID: serverID,
-		ctx:      ctx,
 		method:   "/PackRaftService/RequestVote",
 		req:      in,
 		res:      out,
 	})
 }
 
-func (c *Client) AppendEntries(serverID uint32, ctx context.Context, in *protos.AppendEntriesRequest, out *protos.AppendEntriesResponse) {
+func (c *Client) AppendEntries(serverID uint32, in *protos.AppendEntriesRequest, out *protos.AppendEntriesResponse) {
 	c.queue = append(c.queue, request{
 		serverID: serverID,
-		ctx:      ctx,
 		method:   "/PackRaftService/AppendEntries",
 		req:      in,
 		res:      out,
@@ -80,15 +84,17 @@ func (c *Client) AppendEntries(serverID uint32, ctx context.Context, in *protos.
 
 func (c *Client) Commit() {
 	for _, req := range c.queue {
-		go c.invoke(req.serverID, req.ctx, req.method, req.req, req.res)
+		go c.invoke(req.serverID, req.method, req.req, req.res)
 	}
 }
 
-func (c *Client) invoke(serverID uint32, ctx context.Context, method string, req interface{}, res interface{}) {
+func (c *Client) invoke(serverID uint32, method string, req interface{}, res interface{}) {
 	var err error
 	conn, ok := c.conns[serverID]
 	if ok {
+		ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 		err = conn.Invoke(ctx, method, req, res)
+		cancel()
 	} else {
 		err = ErrServerNotFound
 	}
