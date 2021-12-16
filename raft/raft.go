@@ -44,6 +44,7 @@ const (
 	Follower            = 1
 	Candidate           = 2
 	Leader              = 3
+	Passive             = 4
 )
 
 type MessageHandler interface {
@@ -70,6 +71,7 @@ type machineState struct {
 
 func newFollowerState() *machineState {
 	state := new(machineState)
+	state.stateType = Follower
 	state.messageHandlers = []MessageHandler{
 		tickHandler{},
 	}
@@ -79,6 +81,7 @@ func newFollowerState() *machineState {
 
 func newCandidateState(rs *raftState) *machineState {
 	state := new(machineState)
+	state.stateType = Candidate
 	state.messageHandlers = []MessageHandler{
 		tickHandler{},
 	}
@@ -91,6 +94,7 @@ func newCandidateState(rs *raftState) *machineState {
 
 func newLeaderState(rs *raftState) *machineState {
 	state := new(machineState)
+	state.stateType = Leader
 	state.messageHandlers = []MessageHandler{
 		leaderTickHandler{},
 	}
@@ -100,7 +104,18 @@ func newLeaderState(rs *raftState) *machineState {
 	return state
 }
 
+func newPassiveState(rs *raftState) *machineState {
+	state := new(machineState)
+	state.stateType = Passive
+	state.messageHandlers = []MessageHandler{
+		passiveTickHandler{},
+	}
+	return state
+}
+
 type Raft struct {
+	passive bool
+
 	client    *Client
 	server    *Server
 	raftState *raftState
@@ -110,11 +125,19 @@ type Raft struct {
 	responseCh chan IncomingResponseEnvelope
 }
 
-func New(id uint32) *Raft {
+type RaftOpts = func(*Raft)
+
+func WithPassive(passive bool) func(*Raft) {
+	return func(rf *Raft) {
+		rf.passive = passive
+	}
+}
+
+func New(id uint32, opts ...RaftOpts) *Raft {
 	requestCh := make(chan IncomingRequestEnvelope)
 	responseCh := make(chan IncomingResponseEnvelope)
 
-	return &Raft{
+	rf := &Raft{
 		client:     NewClient(responseCh),
 		server:     NewServer(requestCh),
 		raftState:  &raftState{serverID: id},
@@ -122,12 +145,21 @@ func New(id uint32) *Raft {
 		requestCh:  requestCh,
 		responseCh: responseCh,
 	}
+	for _, opt := range opts {
+		opt(rf)
+	}
+	return rf
 }
 
-func (r *Raft) Start(lis net.Listener) error {
-	cur := newFollowerState()
-	go r.stateMachineLoop(cur)
-	return r.server.Serve(lis)
+func (rf *Raft) Start(lis net.Listener) error {
+	var cur *machineState
+	if rf.passive {
+		cur = newPassiveState(rf.raftState)
+	} else {
+		cur = newFollowerState()
+	}
+	go rf.stateMachineLoop(cur)
+	return rf.server.Serve(lis)
 }
 
 func (r *Raft) Propose(ctx context.Context, cmd []byte) (uint64, error) {
@@ -239,4 +271,12 @@ func (h leaderTickHandler) Execute(cur *machineState, rs *raftState, c *Client, 
 
 func randInt(min int, max int) int {
 	return rand.Intn(max-min+1) + min
+}
+
+type passiveTickHandler struct {
+}
+
+func (h passiveTickHandler) Execute(cur *machineState, rs *raftState, c *Client, msg interface{}) *machineState {
+	// no-op so that nodes joining a cluster won't attempt to become leader
+	return cur
 }
