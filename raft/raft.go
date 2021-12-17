@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -9,6 +10,10 @@ import (
 	"time"
 
 	"github.com/allankerr/packraft/protos"
+)
+
+var (
+	ErrNotLeader = errors.New("node is not leader")
 )
 
 const (
@@ -26,7 +31,12 @@ type LogEntry struct {
 type tickMessage struct {
 }
 
-type proposeMessage struct {
+type proposeRequest struct {
+	cmd []byte
+}
+
+type proposeResponse struct {
+	index uint64
 }
 
 type raftState struct {
@@ -72,6 +82,7 @@ func newFollowerState() *machineState {
 	state.stateType = Follower
 	state.requestHandlers = []RequestHandler{
 		tickHandler{},
+		rejectProposeHandler{},
 	}
 	state.electionTimeoutTicks = randInt(minElectionTimeoutTicks, maxElectionTimeoutTicks)
 	return state
@@ -82,6 +93,7 @@ func newCandidateState(rs *raftState) *machineState {
 	state.stateType = Candidate
 	state.requestHandlers = []RequestHandler{
 		tickHandler{},
+		rejectProposeHandler{},
 	}
 	state.electionTimeoutTicks = randInt(minElectionTimeoutTicks, maxElectionTimeoutTicks)
 
@@ -95,6 +107,7 @@ func newLeaderState(rs *raftState) *machineState {
 	state.stateType = Leader
 	state.requestHandlers = []RequestHandler{
 		leaderTickHandler{},
+		leaderProposeHandler{},
 	}
 
 	rs.votedFor = nil
@@ -107,6 +120,7 @@ func newPassiveState(rs *raftState) *machineState {
 	state.stateType = Passive
 	state.requestHandlers = []RequestHandler{
 		passiveTickHandler{},
+		rejectProposeHandler{},
 	}
 	return state
 }
@@ -160,14 +174,26 @@ func (rf *Raft) Start(lis net.Listener) error {
 	return rf.server.Serve(lis)
 }
 
-func (r *Raft) Propose(ctx context.Context, cmd []byte) (uint64, error) {
-	return 0, nil
+func (rf *Raft) Propose(ctx context.Context, cmd []byte) (uint64, error) {
+	propose := IncomingRequestEnvelope{
+		ctx:        ctx,
+		msg:        proposeRequest{cmd: cmd},
+		responseCh: make(chan OutgoingResponseEnvelope),
+	}
+	defer close(propose.responseCh)
+	rf.requestCh <- propose
+	out := <-propose.responseCh
+	if out.err != nil {
+		return 0, out.err
+	}
+	res := out.msg.(proposeResponse)
+	return res.index, nil
 }
 
 func (rf *Raft) stateMachineLoop(cur *machineState) {
 	tick := IncomingRequestEnvelope{
 		ctx:        context.Background(),
-		msg:        &tickMessage{},
+		msg:        tickMessage{},
 		responseCh: make(chan OutgoingResponseEnvelope, 1),
 	}
 	defer close(tick.responseCh)
@@ -229,7 +255,7 @@ type tickHandler struct {
 }
 
 func (h tickHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx context.Context, msg interface{}) (*machineState, interface{}, error) {
-	if _, ok := msg.(*tickMessage); !ok {
+	if _, ok := msg.(tickMessage); !ok {
 		return nil, nil, nil
 	}
 	cur.electionTimeoutTicks--
@@ -255,17 +281,44 @@ type leaderTickHandler struct {
 }
 
 func (h leaderTickHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx context.Context, msg interface{}) (*machineState, interface{}, error) {
+	if _, ok := msg.(tickMessage); !ok {
+		return nil, nil, nil
+	}
 	return cur, nil, nil
 }
 
-func randInt(min int, max int) int {
-	return rand.Intn(max-min+1) + min
+type leaderProposeHandler struct {
+}
+
+func (h leaderProposeHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx context.Context, msg interface{}) (*machineState, interface{}, error) {
+	if _, ok := msg.(proposeRequest); !ok {
+		return nil, nil, nil
+	}
+	log.Println("successful proposal")
+	return cur, proposeResponse{}, nil
 }
 
 type passiveTickHandler struct {
 }
 
 func (h passiveTickHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx context.Context, msg interface{}) (*machineState, interface{}, error) {
+	if _, ok := msg.(tickMessage); !ok {
+		return nil, nil, nil
+	}
 	// no-op so that nodes joining a cluster won't attempt to become leader
 	return cur, nil, nil
+}
+
+type rejectProposeHandler struct {
+}
+
+func (h rejectProposeHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx context.Context, msg interface{}) (*machineState, interface{}, error) {
+	if _, ok := msg.(proposeRequest); !ok {
+		return nil, nil, nil
+	}
+	return cur, proposeResponse{}, ErrNotLeader
+}
+
+func randInt(min int, max int) int {
+	return rand.Intn(max-min+1) + min
 }

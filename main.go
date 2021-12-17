@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"time"
 
 	"strconv"
 
@@ -56,6 +58,11 @@ func main() {
 		os.Exit(1)
 	}
 	rf := raft.New(**serverID, raft.WithPassive(*passive))
+	go func() {
+
+		time.Sleep(time.Second * 3)
+		rf.Propose(context.Background(), []byte{1, 1, 1, 1})
+	}()
 	if err := rf.Start(*lis); err != nil {
 		log.Fatalf("error starting Raft node: %v", err)
 	}
