@@ -26,6 +26,9 @@ type LogEntry struct {
 type tickMessage struct {
 }
 
+type proposeMessage struct {
+}
+
 type raftState struct {
 	serverID uint32
 	peers    []uint32
@@ -47,10 +50,6 @@ const (
 	Passive             = 4
 )
 
-type MessageHandler interface {
-	Execute(cur *machineState, rs *raftState, c *Client, msg interface{}) *machineState
-}
-
 type RequestHandler interface {
 	Execute(cur *machineState, rs *raftState, c *Client, ctx context.Context, msg interface{}) (*machineState, interface{}, error)
 }
@@ -63,7 +62,6 @@ type machineState struct {
 	stateType        StateType
 	requestHandlers  []RequestHandler
 	responseHandlers []ResponseHandler
-	messageHandlers  []MessageHandler
 
 	electionTimeoutTicks int
 	votes                int
@@ -72,7 +70,7 @@ type machineState struct {
 func newFollowerState() *machineState {
 	state := new(machineState)
 	state.stateType = Follower
-	state.messageHandlers = []MessageHandler{
+	state.requestHandlers = []RequestHandler{
 		tickHandler{},
 	}
 	state.electionTimeoutTicks = randInt(minElectionTimeoutTicks, maxElectionTimeoutTicks)
@@ -82,7 +80,7 @@ func newFollowerState() *machineState {
 func newCandidateState(rs *raftState) *machineState {
 	state := new(machineState)
 	state.stateType = Candidate
-	state.messageHandlers = []MessageHandler{
+	state.requestHandlers = []RequestHandler{
 		tickHandler{},
 	}
 	state.electionTimeoutTicks = randInt(minElectionTimeoutTicks, maxElectionTimeoutTicks)
@@ -95,7 +93,7 @@ func newCandidateState(rs *raftState) *machineState {
 func newLeaderState(rs *raftState) *machineState {
 	state := new(machineState)
 	state.stateType = Leader
-	state.messageHandlers = []MessageHandler{
+	state.requestHandlers = []RequestHandler{
 		leaderTickHandler{},
 	}
 
@@ -107,7 +105,7 @@ func newLeaderState(rs *raftState) *machineState {
 func newPassiveState(rs *raftState) *machineState {
 	state := new(machineState)
 	state.stateType = Passive
-	state.messageHandlers = []MessageHandler{
+	state.requestHandlers = []RequestHandler{
 		passiveTickHandler{},
 	}
 	return state
@@ -167,6 +165,12 @@ func (r *Raft) Propose(ctx context.Context, cmd []byte) (uint64, error) {
 }
 
 func (rf *Raft) stateMachineLoop(cur *machineState) {
+	tick := IncomingRequestEnvelope{
+		ctx:        context.Background(),
+		msg:        &tickMessage{},
+		responseCh: make(chan OutgoingResponseEnvelope, 1),
+	}
+	defer close(tick.responseCh)
 	for {
 		var next *machineState
 		select {
@@ -175,7 +179,10 @@ func (rf *Raft) stateMachineLoop(cur *machineState) {
 		case res := <-rf.responseCh:
 			next = rf.executeResponse(cur, res)
 		case <-rf.ticker.C:
-			next = rf.executeMessage(cur, &tickMessage{})
+			next = rf.executeRequest(cur, tick)
+			if out := <-tick.responseCh; out.err != nil {
+				log.Fatalf("tick error: %v", out.err)
+			}
 		}
 		cur = next
 	}
@@ -218,38 +225,20 @@ func (rf *Raft) executeResponse(cur *machineState, res IncomingResponseEnvelope)
 	return next
 }
 
-func (rf *Raft) executeMessage(cur *machineState, msg interface{}) *machineState {
-
-	var next *machineState
-	for _, h := range cur.messageHandlers {
-		next = h.Execute(cur, rf.raftState, rf.client, msg)
-		if next != nil {
-			break
-		}
-	}
-	if next == nil {
-		panic(fmt.Errorf("missing message handler for message %v", msg))
-	}
-	rf.raftState.commit()
-	rf.client.Commit()
-	return next
-}
-
 type tickHandler struct {
 }
 
-func (h tickHandler) Execute(cur *machineState, rs *raftState, c *Client, msg interface{}) *machineState {
-
+func (h tickHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx context.Context, msg interface{}) (*machineState, interface{}, error) {
 	if _, ok := msg.(*tickMessage); !ok {
-		return nil
+		return nil, nil, nil
 	}
 	cur.electionTimeoutTicks--
 	if cur.electionTimeoutTicks != 0 {
-		return cur
+		return cur, nil, nil
 	}
 	if len(rs.peers) == 0 {
 		log.Println("become leader")
-		return newLeaderState(rs)
+		return newLeaderState(rs), nil, nil
 	}
 	for _, peerID := range rs.peers {
 		req := protos.RequestVoteRequest{
@@ -259,14 +248,14 @@ func (h tickHandler) Execute(cur *machineState, rs *raftState, c *Client, msg in
 		res := protos.RequestVoteResponse{}
 		c.RequestVote(peerID, &req, &res)
 	}
-	return newCandidateState(rs)
+	return newCandidateState(rs), nil, nil
 }
 
 type leaderTickHandler struct {
 }
 
-func (h leaderTickHandler) Execute(cur *machineState, rs *raftState, c *Client, msg interface{}) *machineState {
-	return cur
+func (h leaderTickHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx context.Context, msg interface{}) (*machineState, interface{}, error) {
+	return cur, nil, nil
 }
 
 func randInt(min int, max int) int {
@@ -276,7 +265,7 @@ func randInt(min int, max int) int {
 type passiveTickHandler struct {
 }
 
-func (h passiveTickHandler) Execute(cur *machineState, rs *raftState, c *Client, msg interface{}) *machineState {
+func (h passiveTickHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx context.Context, msg interface{}) (*machineState, interface{}, error) {
 	// no-op so that nodes joining a cluster won't attempt to become leader
-	return cur
+	return cur, nil, nil
 }
