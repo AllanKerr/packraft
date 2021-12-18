@@ -2,68 +2,46 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"time"
 
-	"strconv"
-
 	"github.com/allankerr/packraft/raft"
+	flag "github.com/spf13/pflag"
 )
 
-func uint32Flag(name string, usage string) **uint32 {
-	var out *uint32
-	flag.Func(name, usage, func(raw string) error {
-		tmp, err := strconv.ParseUint(raw, 10, 32)
-		if err != nil {
-			return err
-		}
-		val := uint32(tmp)
-		out = &val
-		return nil
-	})
-	return &out
-}
-
-func listenerFlag(name string, usage string) *net.Listener {
-	var lis net.Listener
-	flag.Func(name, usage, func(raw string) error {
-		tmp, err := net.Listen("tcp", raw)
-		if err != nil {
-			return err
-		}
-		lis = tmp
-		return nil
-	})
-	return &lis
-}
-
 func main() {
-	serverID := uint32Flag("id", "Server ID used to identify the Raft node")
-	lis := listenerFlag("address", "Address for the Raft node to listen at")
+	serverID := flag.Uint32("id", 0, "Server ID used to identify the Raft node")
+	address := flag.String("address", "", "Address for the Raft node to listen at")
 	passive := flag.Bool("passive", false, "Starts the node in passive mode waiting to join an existing cluster")
 	flag.Parse()
 
-	if *serverID == nil {
-		fmt.Fprintf(flag.CommandLine.Output(), "Missing required flag: id\n")
+	if !flag.Lookup("id").Changed {
+		fmt.Println("Missing required flag: id")
+		flag.Usage()
+		os.Exit(1)
+
+	}
+	if !flag.Lookup("address").Changed {
+		fmt.Println("Missing required flag: address")
 		flag.Usage()
 		os.Exit(1)
 	}
-	if *lis == nil {
-		fmt.Fprintf(flag.CommandLine.Output(), "Missing required flag: address\n")
+	lis, err := net.Listen("tcp", *address)
+	if err != nil {
+		fmt.Printf("Error listening on address: %v", err)
 		flag.Usage()
 		os.Exit(1)
 	}
-	rf := raft.New(**serverID, raft.WithPassive(*passive))
+	rf := raft.New(*serverID, raft.WithPassive(*passive))
 	go func() {
 
 		time.Sleep(time.Second * 3)
 		rf.Propose(context.Background(), []byte{1, 1, 1, 1})
 	}()
-	if err := rf.Start(*lis); err != nil {
+	if err := rf.Start(lis); err != nil {
 		log.Fatalf("error starting Raft node: %v", err)
 	}
 }
