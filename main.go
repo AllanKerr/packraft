@@ -13,9 +13,9 @@ import (
 )
 
 func main() {
-	serverID := flag.Uint32("id", 0, "Server ID used to identify the Raft node")
-	address := flag.String("address", "", "Address for the Raft node to listen at")
-	passive := flag.Bool("passive", false, "Starts the node in passive mode waiting to join an existing cluster")
+	serverID := flag.Uint("me", 0, "ID for this Raft node")
+	serverIDs := flag.UintSlice("id", nil, "IDs for the Raft nodes in the cluster")
+	addresses := flag.StringSlice("address", nil, "Addresses for the Raft nodes in the cluster")
 	flag.Parse()
 
 	if !flag.Lookup("id").Changed {
@@ -24,18 +24,36 @@ func main() {
 		os.Exit(1)
 
 	}
-	if !flag.Lookup("address").Changed {
-		fmt.Println("Missing required flag: address")
+	if len(*serverIDs) != len(*addresses) {
+		fmt.Println("There must be the same number of IDs and addresses")
 		flag.Usage()
 		os.Exit(1)
 	}
-	lis, err := net.Listen("tcp", *address)
+	cluster := make(map[uint32]string)
+	for i := range *serverIDs {
+		id := uint32((*serverIDs)[i])
+		if _, ok := cluster[id]; ok {
+			fmt.Printf("Multiple addresses found for %v\n", id)
+			flag.Usage()
+			os.Exit(1)
+		}
+		cluster[id] = (*addresses)[i]
+	}
+	id := uint32(*serverID)
+	addr, ok := cluster[id]
+	if !ok {
+		fmt.Printf("Missing address for %v\n", id)
+		flag.Usage()
+		os.Exit(1)
+
+	}
+	lis, err := net.Listen("tcp", addr)
 	if err != nil {
-		fmt.Printf("Error listening on address: %v", err)
+		fmt.Printf("Error listening on address %v", err)
 		flag.Usage()
 		os.Exit(1)
 	}
-	rf := raft.New(*serverID, raft.WithPassive(*passive))
+	rf := raft.New(id, cluster)
 	go func() {
 
 		time.Sleep(time.Second * 3)

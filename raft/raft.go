@@ -40,8 +40,8 @@ type proposeResponse struct {
 }
 
 type raftState struct {
-	serverID uint32
-	peers    []uint32
+	me       uint32
+	cluster  map[uint32]string
 	term     uint64
 	votedFor *uint32
 }
@@ -95,9 +95,12 @@ func newCandidateState(rs *raftState) *machineState {
 		tickHandler{},
 		rejectProposeHandler{},
 	}
+	state.responseHandlers = []ResponseHandler{
+		voteResponseHandler{},
+	}
 	state.electionTimeoutTicks = randInt(minElectionTimeoutTicks, maxElectionTimeoutTicks)
 
-	rs.votedFor = &rs.serverID
+	rs.votedFor = &rs.me
 	rs.term += 1
 	return state
 }
@@ -115,19 +118,7 @@ func newLeaderState(rs *raftState) *machineState {
 	return state
 }
 
-func newPassiveState(rs *raftState) *machineState {
-	state := new(machineState)
-	state.stateType = Passive
-	state.requestHandlers = []RequestHandler{
-		passiveTickHandler{},
-		rejectProposeHandler{},
-	}
-	return state
-}
-
 type Raft struct {
-	passive bool
-
 	client    *Client
 	server    *Server
 	raftState *raftState
@@ -139,20 +130,18 @@ type Raft struct {
 
 type RaftOpts = func(*Raft)
 
-func WithPassive(passive bool) func(*Raft) {
-	return func(rf *Raft) {
-		rf.passive = passive
-	}
-}
-
-func New(id uint32, opts ...RaftOpts) *Raft {
+func New(id uint32, cluster map[uint32]string, opts ...RaftOpts) *Raft {
 	requestCh := make(chan IncomingRequestEnvelope)
 	responseCh := make(chan IncomingResponseEnvelope)
 
+	rs := &raftState{
+		me:      id,
+		cluster: cluster,
+	}
 	rf := &Raft{
 		client:     NewClient(responseCh),
 		server:     NewServer(requestCh),
-		raftState:  &raftState{serverID: id},
+		raftState:  rs,
 		ticker:     time.NewTicker(tickDuration),
 		requestCh:  requestCh,
 		responseCh: responseCh,
@@ -164,11 +153,13 @@ func New(id uint32, opts ...RaftOpts) *Raft {
 }
 
 func (rf *Raft) Start(lis net.Listener) error {
-	var cur *machineState
-	if rf.passive {
-		cur = newPassiveState(rf.raftState)
-	} else {
-		cur = newFollowerState()
+	cur := newFollowerState()
+	for id, addr := range rf.raftState.cluster {
+		if id != rf.raftState.me {
+			if err := rf.client.Connect(id, addr); err != nil {
+				return err
+			}
+		}
 	}
 	go rf.stateMachineLoop(cur)
 	return rf.server.Serve(lis)
@@ -262,17 +253,19 @@ func (h tickHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx co
 	if cur.electionTimeoutTicks != 0 {
 		return cur, nil, nil
 	}
-	if len(rs.peers) == 0 {
+	if len(rs.cluster) == 1 {
 		log.Println("become leader")
 		return newLeaderState(rs), nil, nil
 	}
-	for _, peerID := range rs.peers {
-		req := protos.RequestVoteRequest{
-			Term:        rs.term,
-			CandidateId: rs.serverID,
+	for id := range rs.cluster {
+		if id != rs.me {
+			req := protos.RequestVoteRequest{
+				Term:        rs.term,
+				CandidateId: rs.me,
+			}
+			res := protos.RequestVoteResponse{}
+			c.RequestVote(id, &req, &res)
 		}
-		res := protos.RequestVoteResponse{}
-		c.RequestVote(peerID, &req, &res)
 	}
 	return newCandidateState(rs), nil, nil
 }
@@ -298,17 +291,6 @@ func (h leaderProposeHandler) Execute(cur *machineState, rs *raftState, c *Clien
 	return cur, proposeResponse{}, nil
 }
 
-type passiveTickHandler struct {
-}
-
-func (h passiveTickHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx context.Context, msg interface{}) (*machineState, interface{}, error) {
-	if _, ok := msg.(tickMessage); !ok {
-		return nil, nil, nil
-	}
-	// no-op so that nodes joining a cluster won't attempt to become leader
-	return cur, nil, nil
-}
-
 type rejectProposeHandler struct {
 }
 
@@ -317,6 +299,17 @@ func (h rejectProposeHandler) Execute(cur *machineState, rs *raftState, c *Clien
 		return nil, nil, nil
 	}
 	return cur, proposeResponse{}, ErrNotLeader
+}
+
+type voteResponseHandler struct {
+}
+
+func (h voteResponseHandler) Execute(cur *machineState, rs *raftState, c *Client, serverID uint32, msg interface{}, err error) *machineState {
+	if _, ok := msg.(*protos.RequestVoteResponse); !ok {
+		return nil
+	}
+	log.Printf("Vote response from: %v %v", serverID, err)
+	return cur
 }
 
 func randInt(min int, max int) int {
