@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"reflect"
 
 	"github.com/allankerr/packraft/protos"
 	"google.golang.org/grpc"
@@ -22,7 +23,7 @@ type OutgoingResponseEnvelope struct {
 
 type Server struct {
 	requestCh chan IncomingRequestEnvelope
-	protos.UnsafePackRaftServiceServer
+	protos.PackRaftServiceServer
 }
 
 func NewServer(requestCh chan IncomingRequestEnvelope) *Server {
@@ -31,6 +32,7 @@ func NewServer(requestCh chan IncomingRequestEnvelope) *Server {
 
 func (s *Server) Serve(lis net.Listener) error {
 	server := grpc.NewServer()
+	protos.RegisterPackRaftServiceServer(server, s)
 	if err := server.Serve(lis); err != nil {
 		return err
 	}
@@ -48,10 +50,10 @@ func (s *Server) RequestVote(ctx context.Context, req *protos.RequestVoteRequest
 	if out.err != nil {
 		return nil, out.err
 	}
-	if res, ok := out.msg.(*protos.RequestVoteResponse); !ok {
+	if res, ok := out.msg.(*protos.RequestVoteResponse); ok {
 		return res, nil
 	}
-	panic(fmt.Sprintf("method RequestVote returned an unexpected response %v", out.msg))
+	panic(fmt.Sprintf("method RequestVote returned an unexpected response %v{%v}", reflect.TypeOf(out.msg), out.msg))
 }
 
 func (s *Server) AppendEntries(ctx context.Context, req *protos.AppendEntriesRequest) (*protos.AppendEntriesResponse, error) {
@@ -65,8 +67,8 @@ func (s *Server) AppendEntries(ctx context.Context, req *protos.AppendEntriesReq
 	if out.err != nil {
 		return nil, out.err
 	}
-	if res, ok := out.msg.(*protos.AppendEntriesResponse); !ok {
+	if res, ok := out.msg.(*protos.AppendEntriesResponse); ok {
 		return res, nil
 	}
-	panic(fmt.Sprintf("method AppendEntries returned an unexpected response %v", out.msg))
+	panic(fmt.Sprintf("method AppendEntries returned an unexpected response %v{%v}", reflect.TypeOf(out.msg), out.msg))
 }

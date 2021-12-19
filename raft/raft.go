@@ -3,7 +3,6 @@ package raft
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"math/rand"
 	"net"
@@ -83,38 +82,36 @@ func newFollowerState() *machineState {
 	state.requestHandlers = []RequestHandler{
 		tickHandler{},
 		rejectProposeHandler{},
+		voteRequestHandler{},
 	}
 	state.electionTimeoutTicks = randInt(minElectionTimeoutTicks, maxElectionTimeoutTicks)
 	return state
 }
 
-func newCandidateState(rs *raftState) *machineState {
+func newCandidateState() *machineState {
 	state := new(machineState)
 	state.stateType = Candidate
 	state.requestHandlers = []RequestHandler{
 		tickHandler{},
 		rejectProposeHandler{},
+		voteRequestHandler{},
 	}
 	state.responseHandlers = []ResponseHandler{
 		voteResponseHandler{},
 	}
 	state.electionTimeoutTicks = randInt(minElectionTimeoutTicks, maxElectionTimeoutTicks)
-
-	rs.votedFor = &rs.me
-	rs.term += 1
+	state.votes = 1
 	return state
 }
 
-func newLeaderState(rs *raftState) *machineState {
+func newLeaderState() *machineState {
 	state := new(machineState)
 	state.stateType = Leader
 	state.requestHandlers = []RequestHandler{
 		leaderTickHandler{},
 		leaderProposeHandler{},
+		voteRequestHandler{},
 	}
-
-	rs.votedFor = nil
-	rs.term += 1
 	return state
 }
 
@@ -217,7 +214,7 @@ func (rf *Raft) executeRequest(cur *machineState, req IncomingRequestEnvelope) *
 		}
 	}
 	if next == nil {
-		panic(fmt.Errorf("missing request handler for message %v", req.msg))
+		log.Fatalf("missing request handler for message %v", req.msg)
 	}
 	rf.raftState.commit()
 	rf.client.Commit()
@@ -235,7 +232,7 @@ func (rf *Raft) executeResponse(cur *machineState, res IncomingResponseEnvelope)
 		}
 	}
 	if next == nil {
-		panic(fmt.Errorf("missing response handler for message %v", res.msg))
+		log.Fatalf("missing response handler for message %v", res.msg)
 	}
 	rf.raftState.commit()
 	rf.client.Commit()
@@ -254,9 +251,10 @@ func (h tickHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx co
 		return cur, nil, nil
 	}
 	if len(rs.cluster) == 1 {
-		log.Println("become leader")
-		return newLeaderState(rs), nil, nil
+		return newLeaderState(), nil, nil
 	}
+	rs.term += 1
+	rs.votedFor = &rs.me
 	for id := range rs.cluster {
 		if id != rs.me {
 			req := protos.RequestVoteRequest{
@@ -267,7 +265,7 @@ func (h tickHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx co
 			c.RequestVote(id, &req, &res)
 		}
 	}
-	return newCandidateState(rs), nil, nil
+	return newCandidateState(), nil, nil
 }
 
 type leaderTickHandler struct {
@@ -287,7 +285,6 @@ func (h leaderProposeHandler) Execute(cur *machineState, rs *raftState, c *Clien
 	if _, ok := msg.(proposeRequest); !ok {
 		return nil, nil, nil
 	}
-	log.Println("successful proposal")
 	return cur, proposeResponse{}, nil
 }
 
@@ -301,15 +298,68 @@ func (h rejectProposeHandler) Execute(cur *machineState, rs *raftState, c *Clien
 	return cur, proposeResponse{}, ErrNotLeader
 }
 
+type voteRequestHandler struct {
+}
+
+func (h voteRequestHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx context.Context, msg interface{}) (*machineState, interface{}, error) {
+	req, ok := msg.(*protos.RequestVoteRequest)
+	if !ok {
+		return nil, nil, nil
+	}
+	if req.Term <= rs.term {
+		return cur, &protos.RequestVoteResponse{Term: rs.term, VoteGranted: false}, nil
+	}
+	rs.term = req.Term
+	rs.votedFor = nil
+
+	next := cur
+	voteGranted := h.hasVote(rs, req.CandidateId, req.Term) 
+	if voteGranted {
+		rs.votedFor = &req.CandidateId
+		next = newFollowerState()
+	}
+	return next, &protos.RequestVoteResponse{Term: rs.term, VoteGranted: voteGranted}, nil
+}
+
+func (h voteRequestHandler) hasVote(rs *raftState, candidateID uint32, term uint64) bool {
+	if term < rs.term {
+		return false
+	}
+	if rs.votedFor != nil && *rs.votedFor != candidateID {
+		return false
+	}
+	return true
+}
+
 type voteResponseHandler struct {
 }
 
 func (h voteResponseHandler) Execute(cur *machineState, rs *raftState, c *Client, serverID uint32, msg interface{}, err error) *machineState {
-	if _, ok := msg.(*protos.RequestVoteResponse); !ok {
+	res, ok := msg.(*protos.RequestVoteResponse)
+	if !ok {
 		return nil
 	}
-	log.Printf("Vote response from: %v %v", serverID, err)
-	return cur
+	if err != nil {
+		return cur
+	}
+	if res.Term > rs.term {
+		rs.term = res.Term
+		return newFollowerState() 
+	}
+	if res.Term != rs.term {
+		return cur
+	}
+	if res.VoteGranted {
+		cur.votes += 1
+	}
+	majority := len(rs.cluster) / 2 + 1
+	if cur.votes < majority {
+		return cur
+	}
+	rs.term += 1
+	rs.votedFor = nil
+	log.Printf("[%v] become leader", rs.me)
+	return newLeaderState()
 }
 
 func randInt(min int, max int) int {

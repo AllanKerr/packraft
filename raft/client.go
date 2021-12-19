@@ -86,6 +86,7 @@ func (c *Client) Commit() {
 	for _, req := range c.queue {
 		go c.invoke(req.serverID, req.method, req.req, req.res)
 	}
+	c.queue = nil
 }
 
 func (c *Client) invoke(serverID uint32, method string, req interface{}, res interface{}) {
