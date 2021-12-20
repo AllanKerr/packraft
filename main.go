@@ -54,12 +54,23 @@ func main() {
 		os.Exit(1)
 	}
 	rf := raft.New(id, cluster)
-	go func() {
-
-		time.Sleep(time.Second * 3)
-		rf.Propose(context.Background(), []byte{1, 1, 1, 1})
-	}()
+	go proposeLoop(rf)
+	go applyLoop(rf)
 	if err := rf.Start(lis); err != nil {
 		log.Fatalf("error starting Raft node: %v", err)
+	}
+}
+
+func proposeLoop(rf *raft.Raft) {
+	for {
+		time.Sleep(time.Second * 3)
+		rf.Propose(context.Background(), []byte{1, 1, 1, 1})
+	}
+}
+
+func applyLoop(rf *raft.Raft) {
+	for {
+		entry := <-rf.C
+		log.Printf("Applied entry %v %v", entry.Index, entry.Command)
 	}
 }

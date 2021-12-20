@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"sort"
 	"time"
 
 	"github.com/allankerr/packraft/protos"
@@ -44,8 +45,11 @@ type raftState struct {
 	term         uint64
 	votedFor     *uint32
 
-	log         *Log
-	commitIndex uint64
+	log              *Log
+	commitIndex      uint64
+	lastAppliedIndex uint64
+
+	applyCh chan LogEntry
 }
 
 func (rs *raftState) commit() {
@@ -142,6 +146,11 @@ func newLeaderState(rs *raftState) *machineState {
 	return state
 }
 
+type LogEntry struct {
+	Index   uint64
+	Command []byte
+}
+
 type Raft struct {
 	client    *Client
 	server    *Server
@@ -150,6 +159,8 @@ type Raft struct {
 	ticker     *time.Ticker
 	requestCh  chan IncomingRequestEnvelope
 	responseCh chan IncomingResponseEnvelope
+
+	C chan LogEntry
 }
 
 type RaftOpts = func(*Raft)
@@ -162,6 +173,7 @@ func New(id uint32, cluster map[uint32]string, opts ...RaftOpts) *Raft {
 		me:      id,
 		cluster: cluster,
 		log:     &Log{},
+		applyCh: make(chan LogEntry),
 	}
 	rf := &Raft{
 		client:     NewClient(responseCh),
@@ -170,6 +182,7 @@ func New(id uint32, cluster map[uint32]string, opts ...RaftOpts) *Raft {
 		ticker:     time.NewTicker(tickDuration),
 		requestCh:  requestCh,
 		responseCh: responseCh,
+		C:          rs.applyCh,
 	}
 	for _, opt := range opts {
 		opt(rf)
@@ -426,7 +439,13 @@ func (h appendEntriesHandler) Execute(cur *machineState, rs *raftState, c *Clien
 
 	success := rs.log.HasEntry(req.PrevLogIndex, req.PrevLogTerm)
 	if success {
-		// TODO: Append
+		var entries []Entry
+		for _, entry := range req.Entries {
+			entries = append(entries, Entry{Term: entry.Term, Command: entry.Command})
+		}
+		rs.log.AppendTail(req.PrevLogIndex+1, entries)
+		rs.commitIndex = uint64Min(req.LeaderCommit, rs.log.LastLogIndex())
+		applyEntries(rs)
 	}
 	return newFollowerState(), &protos.AppendEntriesResponse{
 		Term:         rs.term,
@@ -450,13 +469,14 @@ func (h appendEntriesResponseHandler) Execute(cur *machineState, rs *raftState, 
 		return cur
 	}
 	if !res.Success {
+		cur.nextIndex[serverID] = uint64Max(cur.nextIndex[serverID]-1, 1)
 		return cur
 	}
 	cur.matchIndex[serverID] = uint64Max(cur.matchIndex[serverID], res.LastLogIndex)
 	cur.nextIndex[serverID] = uint64Max(cur.nextIndex[serverID], res.LastLogIndex+1)
 
-	// TODO: commit logs
-
+	rs.commitIndex = computeCommitIndex(cur.matchIndex)
+	applyEntries(rs)
 	return cur
 }
 
@@ -475,7 +495,7 @@ func sendServerEntries(rs *raftState, c *Client, id uint32, nextIndex uint64) {
 	prev := rs.log.Get(prevIndex)
 
 	var entries []*protos.LogEntry
-	for _, entry := range rs.log.Tail(nextIndex) {
+	for _, entry := range rs.log.GetTail(nextIndex) {
 		entries = append(entries, &protos.LogEntry{
 			Term:    entry.Term,
 			Command: entry.Command,
@@ -492,12 +512,41 @@ func sendServerEntries(rs *raftState, c *Client, id uint32, nextIndex uint64) {
 	c.AppendEntries(id, req, &protos.AppendEntriesResponse{})
 }
 
+func computeCommitIndex(matchIndex map[uint32]uint64) uint64 {
+
+	sorted := make([]uint64, 0, len(matchIndex))
+	for _, commitIndex := range matchIndex {
+		sorted = append(sorted, commitIndex)
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	majorityIndex := len(matchIndex) / 2
+	return sorted[majorityIndex]
+}
+
+func applyEntries(rs *raftState) {
+	for i := rs.lastAppliedIndex + 1; i <= rs.commitIndex; i += 1 {
+		entry := rs.log.Get(i)
+		rs.applyCh <- LogEntry{
+			Index:   i,
+			Command: entry.Command,
+		}
+	}
+	rs.lastAppliedIndex = rs.commitIndex
+}
+
 func randInt(min int, max int) int {
 	return rand.Intn(max-min+1) + min
 }
 
 func uint64Max(a uint64, b uint64) uint64 {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+func uint64Min(a uint64, b uint64) uint64 {
+	if a < b {
 		return a
 	}
 	return b
