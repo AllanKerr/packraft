@@ -6,6 +6,7 @@ import (
 
 	"github.com/allankerr/packraft/protos"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -16,6 +17,12 @@ var (
 
 const (
 	defaultTimeout = time.Second
+
+	connectMultiplier = 1.6
+	connectJitter     = 0.2
+	baseConnectDelay  = 50 * time.Millisecond
+	maxConnectDelay   = 1000 * time.Millisecond
+	minConnectTimeout = 20 * time.Second
 )
 
 type request struct {
@@ -47,7 +54,16 @@ func NewClient(responseCh chan IncomingResponseEnvelope) *Client {
 }
 
 func (c *Client) Connect(serverID uint32, addr string) error {
-	conn, err := grpc.Dial(addr, grpc.WithInsecure())
+	config := grpc.ConnectParams{
+		MinConnectTimeout: minConnectTimeout,
+		Backoff: backoff.Config{
+			Multiplier: connectMultiplier,
+			Jitter:     connectJitter,
+			BaseDelay:  baseConnectDelay,
+			MaxDelay:   maxConnectDelay,
+		},
+	}
+	conn, err := grpc.Dial(addr, grpc.WithInsecure(), grpc.WithConnectParams(config))
 	if err != nil {
 		return err
 	}
