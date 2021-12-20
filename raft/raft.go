@@ -22,11 +22,6 @@ const (
 	minElectionTimeoutTicks = 500
 )
 
-type LogEntry struct {
-	Index   uint64
-	Command []byte
-}
-
 type tickMessage struct {
 }
 
@@ -39,14 +34,25 @@ type proposeResponse struct {
 }
 
 type raftState struct {
-	me       uint32
-	cluster  map[uint32]string
-	term     uint64
-	votedFor *uint32
+	me          uint32
+	cluster     map[uint32]string
+	term        uint64
+	votedFor    *uint32
+	log         *Log
+	commitIndex uint64
 }
 
 func (rs *raftState) commit() {
 	// TODO: Commit persistent state
+}
+
+func (rs *raftState) updateTerm(term uint64) bool {
+	if rs.term >= term {
+		return false
+	}
+	rs.term = term
+	rs.votedFor = nil
+	return true
 }
 
 type StateType uint16
@@ -74,6 +80,9 @@ type machineState struct {
 
 	electionTimeoutTicks int
 	votes                int
+
+	matchIndex map[uint32]uint64
+	nextIndex  map[uint32]uint64
 }
 
 func newFollowerState() *machineState {
@@ -83,6 +92,7 @@ func newFollowerState() *machineState {
 		tickHandler{},
 		rejectProposeHandler{},
 		voteRequestHandler{},
+		appendEntriesHandler{},
 	}
 	state.electionTimeoutTicks = randInt(minElectionTimeoutTicks, maxElectionTimeoutTicks)
 	return state
@@ -95,6 +105,7 @@ func newCandidateState() *machineState {
 		tickHandler{},
 		rejectProposeHandler{},
 		voteRequestHandler{},
+		appendEntriesHandler{},
 	}
 	state.responseHandlers = []ResponseHandler{
 		voteResponseHandler{},
@@ -104,7 +115,7 @@ func newCandidateState() *machineState {
 	return state
 }
 
-func newLeaderState() *machineState {
+func newLeaderState(rs *raftState) *machineState {
 	state := new(machineState)
 	state.stateType = Leader
 	state.requestHandlers = []RequestHandler{
@@ -112,6 +123,16 @@ func newLeaderState() *machineState {
 		leaderProposeHandler{},
 		voteRequestHandler{},
 	}
+	state.responseHandlers = []ResponseHandler{
+		appendEntriesResponseHandler{},
+	}
+	state.nextIndex = make(map[uint32]uint64)
+	state.matchIndex = make(map[uint32]uint64)
+	for id := range rs.cluster {
+		state.matchIndex[id] = 0
+		state.nextIndex[id] = rs.log.NextLogIndex()
+	}
+	state.matchIndex[rs.me] = rs.log.LastLogIndex()
 	return state
 }
 
@@ -134,6 +155,7 @@ func New(id uint32, cluster map[uint32]string, opts ...RaftOpts) *Raft {
 	rs := &raftState{
 		me:      id,
 		cluster: cluster,
+		log:     &Log{},
 	}
 	rf := &Raft{
 		client:     NewClient(responseCh),
@@ -251,7 +273,9 @@ func (h tickHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx co
 		return cur, nil, nil
 	}
 	if len(rs.cluster) == 1 {
-		return newLeaderState(), nil, nil
+		next := newLeaderState(rs)
+		sendAllEntries(rs, c, next.nextIndex)
+		return next, nil, nil
 	}
 	rs.term += 1
 	rs.votedFor = &rs.me
@@ -282,9 +306,16 @@ type leaderProposeHandler struct {
 }
 
 func (h leaderProposeHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx context.Context, msg interface{}) (*machineState, interface{}, error) {
-	if _, ok := msg.(proposeRequest); !ok {
+	req, ok := msg.(proposeRequest)
+	if !ok {
 		return nil, nil, nil
 	}
+	rs.log.Append(Entry{
+		Term:    rs.term,
+		Command: req.cmd,
+	})
+	cur.matchIndex[rs.me] = rs.log.LastLogIndex()
+	cur.nextIndex[rs.me] = rs.log.NextLogIndex()
 	return cur, proposeResponse{}, nil
 }
 
@@ -313,7 +344,7 @@ func (h voteRequestHandler) Execute(cur *machineState, rs *raftState, c *Client,
 	rs.votedFor = nil
 
 	next := cur
-	voteGranted := h.hasVote(rs, req.CandidateId, req.Term) 
+	voteGranted := h.hasVote(rs, req.CandidateId, req.Term)
 	if voteGranted {
 		rs.votedFor = &req.CandidateId
 		next = newFollowerState()
@@ -344,7 +375,7 @@ func (h voteResponseHandler) Execute(cur *machineState, rs *raftState, c *Client
 	}
 	if res.Term > rs.term {
 		rs.term = res.Term
-		return newFollowerState() 
+		return newFollowerState()
 	}
 	if res.Term != rs.term {
 		return cur
@@ -352,16 +383,109 @@ func (h voteResponseHandler) Execute(cur *machineState, rs *raftState, c *Client
 	if res.VoteGranted {
 		cur.votes += 1
 	}
-	majority := len(rs.cluster) / 2 + 1
+	majority := len(rs.cluster)/2 + 1
 	if cur.votes < majority {
 		return cur
 	}
 	rs.term += 1
 	rs.votedFor = nil
+
 	log.Printf("[%v] become leader", rs.me)
-	return newLeaderState()
+	next := newLeaderState(rs)
+	sendAllEntries(rs, c, next.nextIndex)
+	return next
+}
+
+type appendEntriesHandler struct {
+}
+
+func (h appendEntriesHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx context.Context, msg interface{}) (*machineState, interface{}, error) {
+	req, ok := msg.(*protos.AppendEntriesRequest)
+	if !ok {
+		return nil, nil, nil
+	}
+	if req.Term < rs.term {
+		return cur, &protos.AppendEntriesResponse{
+			Term:    rs.term,
+			Success: false,
+		}, nil
+	}
+	rs.updateTerm(req.Term)
+
+	success := rs.log.HasEntry(req.PrevLogIndex, req.PrevLogTerm)
+	if success {
+		// TODO: Append
+	}
+	return newFollowerState(), &protos.AppendEntriesResponse{
+		Term:         rs.term,
+		Success:      success,
+		LastLogIndex: rs.log.LastLogIndex(),
+	}, nil
+}
+
+type appendEntriesResponseHandler struct {
+}
+
+func (h appendEntriesResponseHandler) Execute(cur *machineState, rs *raftState, c *Client, serverID uint32, msg interface{}, err error) *machineState {
+	res, ok := msg.(*protos.AppendEntriesResponse)
+	if !ok {
+		return nil
+	}
+	if rs.updateTerm(res.Term) {
+		return newFollowerState()
+	}
+	if res.Term != rs.term {
+		return cur
+	}
+	if !res.Success {
+		return cur
+	}
+	cur.matchIndex[serverID] = uint64Max(cur.matchIndex[serverID], res.LastLogIndex)
+	cur.nextIndex[serverID] = uint64Max(cur.nextIndex[serverID], res.LastLogIndex+1)
+
+	// TODO: commit logs
+
+	return cur
+}
+
+func sendAllEntries(rs *raftState, c *Client, nextIndex map[uint32]uint64) {
+	for id := range rs.cluster {
+		if id != rs.me {
+			sendServerEntries(rs, c, id, nextIndex[id])
+		}
+	}
+}
+
+func sendServerEntries(rs *raftState, c *Client, id uint32, nextIndex uint64) {
+
+	prevIndex := nextIndex - 1
+	prev := rs.log.Get(prevIndex)
+
+	var entries []*protos.LogEntry
+	for _, entry := range rs.log.Tail(nextIndex) {
+		entries = append(entries, &protos.LogEntry{
+			Term:    entry.Term,
+			Command: entry.Command,
+		})
+	}
+	req := &protos.AppendEntriesRequest{
+		Term:         rs.term,
+		LeaderId:     rs.me,
+		PrevLogIndex: prevIndex,
+		PrevLogTerm:  prev.Term,
+		Entries:      entries,
+		LeaderCommit: rs.commitIndex,
+	}
+	c.AppendEntries(id, req, &protos.AppendEntriesResponse{})
 }
 
 func randInt(min int, max int) int {
 	return rand.Intn(max-min+1) + min
+}
+
+func uint64Max(a uint64, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
 }
