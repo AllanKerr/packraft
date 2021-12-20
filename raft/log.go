@@ -36,6 +36,15 @@ func (l *Log) LastLogIndex() uint64 {
 	return uint64(len(l.entries))
 }
 
+func (l *Log) LastLogIndexAndTerm() (uint64, uint64) {
+	if len(l.entries) == 0 {
+		return 0, 0
+	}
+	index := uint64(len(l.entries))
+	e := l.entries[index-1]
+	return index, e.Term
+}
+
 func (l *Log) Get(index uint64) Entry {
 	if index == 0 {
 		return Entry{Term: 0, Command: nil}

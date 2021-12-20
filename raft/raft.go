@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"reflect"
 	"sort"
 	"time"
 
@@ -106,6 +107,9 @@ func newFollowerState() *machineState {
 		voteRequestHandler{},
 		appendEntriesHandler{},
 	}
+	state.responseHandlers = []ResponseHandler{
+		rejectVoteResponseHandler{},
+	}
 	return state
 }
 
@@ -135,6 +139,7 @@ func newLeaderState(rs *raftState) *machineState {
 	}
 	state.responseHandlers = []ResponseHandler{
 		appendEntriesResponseHandler{},
+		rejectVoteResponseHandler{},
 	}
 	state.nextIndex = make(map[uint32]uint64)
 	state.matchIndex = make(map[uint32]uint64)
@@ -256,7 +261,7 @@ func (rf *Raft) executeRequest(cur *machineState, req IncomingRequestEnvelope) *
 		}
 	}
 	if next == nil {
-		log.Fatalf("missing request handler for message %v", req.msg)
+		log.Fatalf("missing %v request handler for message %v{%v}", cur.stateType, reflect.TypeOf(req.msg), req.msg)
 	}
 	rf.raftState.commit()
 	rf.client.Commit()
@@ -274,7 +279,7 @@ func (rf *Raft) executeResponse(cur *machineState, res IncomingResponseEnvelope)
 		}
 	}
 	if next == nil {
-		log.Fatalf("missing response handler for message %v", res.msg)
+		log.Fatalf("missing %v response handler for message %v{%v}", cur.stateType, reflect.TypeOf(res.msg), res.msg)
 	}
 	rf.raftState.commit()
 	rf.client.Commit()
@@ -303,9 +308,12 @@ func (h electionTickHandler) Execute(cur *machineState, rs *raftState, c *Client
 
 	for id := range rs.cluster {
 		if id != rs.me {
+			index, term := rs.log.LastLogIndexAndTerm()
 			req := protos.RequestVoteRequest{
-				Term:        rs.term,
-				CandidateId: rs.me,
+				Term:         rs.term,
+				CandidateId:  rs.me,
+				LastLogIndex: index,
+				LastLogTerm:  term,
 			}
 			res := protos.RequestVoteResponse{}
 			c.RequestVote(id, &req, &res)
@@ -368,7 +376,7 @@ func (h voteRequestHandler) Execute(cur *machineState, rs *raftState, c *Client,
 		return cur, &protos.RequestVoteResponse{Term: rs.term, VoteGranted: false}, nil
 	}
 	next := cur
-	voteGranted := h.hasVote(rs, req.CandidateId, req.Term)
+	voteGranted := h.hasVote(rs, req.CandidateId, req.Term, req.LastLogIndex, req.LastLogTerm)
 	if voteGranted {
 		rs.votedFor = &req.CandidateId
 		rs.resetTimeout(minElectionTimeoutTicks, maxElectionTimeoutTicks)
@@ -377,11 +385,18 @@ func (h voteRequestHandler) Execute(cur *machineState, rs *raftState, c *Client,
 	return next, &protos.RequestVoteResponse{Term: rs.term, VoteGranted: voteGranted}, nil
 }
 
-func (h voteRequestHandler) hasVote(rs *raftState, candidateID uint32, term uint64) bool {
-	if term < rs.term {
+func (h voteRequestHandler) hasVote(rs *raftState, candidateID uint32, currentTerm uint64, lastLogIndex uint64, lastLogTerm uint64) bool {
+	if currentTerm < rs.term {
 		return false
 	}
 	if rs.votedFor != nil && *rs.votedFor != candidateID {
+		return false
+	}
+	index, term := rs.log.LastLogIndexAndTerm()
+	if lastLogTerm < term {
+		return false
+	}
+	if lastLogTerm == term && lastLogIndex < index {
 		return false
 	}
 	return true
@@ -418,6 +433,24 @@ func (h voteResponseHandler) Execute(cur *machineState, rs *raftState, c *Client
 	next := newLeaderState(rs)
 	sendAllEntries(rs, c, next.nextIndex)
 	return next
+}
+
+type rejectVoteResponseHandler struct {
+}
+
+func (h rejectVoteResponseHandler) Execute(cur *machineState, rs *raftState, c *Client, serverID uint32, msg interface{}, err error) *machineState {
+	res, ok := msg.(*protos.RequestVoteResponse)
+	if !ok {
+		return nil
+	}
+	if err != nil {
+		return cur
+	}
+	if rs.updateTerm(res.Term) {
+		rs.resetTimeout(minElectionTimeoutTicks, maxElectionTimeoutTicks)
+		return newFollowerState()
+	}
+	return cur
 }
 
 type appendEntriesHandler struct {
@@ -461,6 +494,9 @@ func (h appendEntriesResponseHandler) Execute(cur *machineState, rs *raftState, 
 	res, ok := msg.(*protos.AppendEntriesResponse)
 	if !ok {
 		return nil
+	}
+	if err != nil {
+		return cur
 	}
 	if rs.updateTerm(res.Term) {
 		return newFollowerState()
