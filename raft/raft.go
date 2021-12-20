@@ -20,6 +20,9 @@ const (
 
 	maxElectionTimeoutTicks = 1000
 	minElectionTimeoutTicks = 500
+
+	maxHeartbeatTimeoutTicks = 100
+	minHeartbeatTimeoutTicks = 50
 )
 
 type tickMessage struct {
@@ -34,16 +37,23 @@ type proposeResponse struct {
 }
 
 type raftState struct {
-	me          uint32
-	cluster     map[uint32]string
-	term        uint64
-	votedFor    *uint32
+	me      uint32
+	cluster map[uint32]string
+
+	timeoutTicks int
+	term         uint64
+	votedFor     *uint32
+
 	log         *Log
 	commitIndex uint64
 }
 
 func (rs *raftState) commit() {
 	// TODO: Commit persistent state
+}
+
+func (rs *raftState) resetTimeout(min int, max int) {
+	rs.timeoutTicks = randInt(min, max)
 }
 
 func (rs *raftState) updateTerm(term uint64) bool {
@@ -78,9 +88,7 @@ type machineState struct {
 	requestHandlers  []RequestHandler
 	responseHandlers []ResponseHandler
 
-	electionTimeoutTicks int
-	votes                int
-
+	votes      int
 	matchIndex map[uint32]uint64
 	nextIndex  map[uint32]uint64
 }
@@ -89,12 +97,11 @@ func newFollowerState() *machineState {
 	state := new(machineState)
 	state.stateType = Follower
 	state.requestHandlers = []RequestHandler{
-		tickHandler{},
+		electionTickHandler{},
 		rejectProposeHandler{},
 		voteRequestHandler{},
 		appendEntriesHandler{},
 	}
-	state.electionTimeoutTicks = randInt(minElectionTimeoutTicks, maxElectionTimeoutTicks)
 	return state
 }
 
@@ -102,7 +109,7 @@ func newCandidateState() *machineState {
 	state := new(machineState)
 	state.stateType = Candidate
 	state.requestHandlers = []RequestHandler{
-		tickHandler{},
+		electionTickHandler{},
 		rejectProposeHandler{},
 		voteRequestHandler{},
 		appendEntriesHandler{},
@@ -110,7 +117,6 @@ func newCandidateState() *machineState {
 	state.responseHandlers = []ResponseHandler{
 		voteResponseHandler{},
 	}
-	state.electionTimeoutTicks = randInt(minElectionTimeoutTicks, maxElectionTimeoutTicks)
 	state.votes = 1
 	return state
 }
@@ -119,7 +125,7 @@ func newLeaderState(rs *raftState) *machineState {
 	state := new(machineState)
 	state.stateType = Leader
 	state.requestHandlers = []RequestHandler{
-		leaderTickHandler{},
+		heartbeatTickHandler{},
 		leaderProposeHandler{},
 		voteRequestHandler{},
 	}
@@ -173,6 +179,7 @@ func New(id uint32, cluster map[uint32]string, opts ...RaftOpts) *Raft {
 
 func (rf *Raft) Start(lis net.Listener) error {
 	cur := newFollowerState()
+	rf.raftState.resetTimeout(minElectionTimeoutTicks, maxElectionTimeoutTicks)
 	for id, addr := range rf.raftState.cluster {
 		if id != rf.raftState.me {
 			if err := rf.client.Connect(id, addr); err != nil {
@@ -261,15 +268,15 @@ func (rf *Raft) executeResponse(cur *machineState, res IncomingResponseEnvelope)
 	return next
 }
 
-type tickHandler struct {
+type electionTickHandler struct {
 }
 
-func (h tickHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx context.Context, msg interface{}) (*machineState, interface{}, error) {
+func (h electionTickHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx context.Context, msg interface{}) (*machineState, interface{}, error) {
 	if _, ok := msg.(tickMessage); !ok {
 		return nil, nil, nil
 	}
-	cur.electionTimeoutTicks--
-	if cur.electionTimeoutTicks != 0 {
+	rs.timeoutTicks -= 1
+	if rs.timeoutTicks != 0 {
 		return cur, nil, nil
 	}
 	if len(rs.cluster) == 1 {
@@ -279,6 +286,8 @@ func (h tickHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx co
 	}
 	rs.term += 1
 	rs.votedFor = &rs.me
+	rs.resetTimeout(minElectionTimeoutTicks, maxElectionTimeoutTicks)
+
 	for id := range rs.cluster {
 		if id != rs.me {
 			req := protos.RequestVoteRequest{
@@ -292,13 +301,18 @@ func (h tickHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx co
 	return newCandidateState(), nil, nil
 }
 
-type leaderTickHandler struct {
+type heartbeatTickHandler struct {
 }
 
-func (h leaderTickHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx context.Context, msg interface{}) (*machineState, interface{}, error) {
+func (h heartbeatTickHandler) Execute(cur *machineState, rs *raftState, c *Client, ctx context.Context, msg interface{}) (*machineState, interface{}, error) {
 	if _, ok := msg.(tickMessage); !ok {
 		return nil, nil, nil
 	}
+	rs.timeoutTicks -= 1
+	if rs.timeoutTicks != 0 {
+		return cur, nil, nil
+	}
+	sendAllEntries(rs, c, cur.nextIndex)
 	return cur, nil, nil
 }
 
@@ -337,16 +351,14 @@ func (h voteRequestHandler) Execute(cur *machineState, rs *raftState, c *Client,
 	if !ok {
 		return nil, nil, nil
 	}
-	if req.Term <= rs.term {
+	if !rs.updateTerm(req.Term) {
 		return cur, &protos.RequestVoteResponse{Term: rs.term, VoteGranted: false}, nil
 	}
-	rs.term = req.Term
-	rs.votedFor = nil
-
 	next := cur
 	voteGranted := h.hasVote(rs, req.CandidateId, req.Term)
 	if voteGranted {
 		rs.votedFor = &req.CandidateId
+		rs.resetTimeout(minElectionTimeoutTicks, maxElectionTimeoutTicks)
 		next = newFollowerState()
 	}
 	return next, &protos.RequestVoteResponse{Term: rs.term, VoteGranted: voteGranted}, nil
@@ -373,8 +385,8 @@ func (h voteResponseHandler) Execute(cur *machineState, rs *raftState, c *Client
 	if err != nil {
 		return cur
 	}
-	if res.Term > rs.term {
-		rs.term = res.Term
+	if rs.updateTerm(res.Term) {
+		rs.resetTimeout(minElectionTimeoutTicks, maxElectionTimeoutTicks)
 		return newFollowerState()
 	}
 	if res.Term != rs.term {
@@ -390,7 +402,6 @@ func (h voteResponseHandler) Execute(cur *machineState, rs *raftState, c *Client
 	rs.term += 1
 	rs.votedFor = nil
 
-	log.Printf("[%v] become leader", rs.me)
 	next := newLeaderState(rs)
 	sendAllEntries(rs, c, next.nextIndex)
 	return next
@@ -411,6 +422,7 @@ func (h appendEntriesHandler) Execute(cur *machineState, rs *raftState, c *Clien
 		}, nil
 	}
 	rs.updateTerm(req.Term)
+	rs.resetTimeout(minElectionTimeoutTicks, maxElectionTimeoutTicks)
 
 	success := rs.log.HasEntry(req.PrevLogIndex, req.PrevLogTerm)
 	if success {
@@ -449,6 +461,7 @@ func (h appendEntriesResponseHandler) Execute(cur *machineState, rs *raftState, 
 }
 
 func sendAllEntries(rs *raftState, c *Client, nextIndex map[uint32]uint64) {
+	rs.resetTimeout(minHeartbeatTimeoutTicks, maxHeartbeatTimeoutTicks)
 	for id := range rs.cluster {
 		if id != rs.me {
 			sendServerEntries(rs, c, id, nextIndex[id])
