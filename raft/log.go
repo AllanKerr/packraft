@@ -1,21 +1,20 @@
 package raft
 
-import "log"
+import (
+	"log"
 
-type Entry struct {
-	Term    uint64
-	Command []byte
-}
+	"github.com/allankerr/packraft/protos"
+)
 
 type Log struct {
-	entries []Entry
+	entries []*protos.LogEntry
 }
 
-func (l *Log) Append(entry Entry) {
+func (l *Log) Append(entry *protos.LogEntry) {
 	l.entries = append(l.entries, entry)
 }
 
-func (l *Log) AppendTail(startIndex uint64, entries []Entry) {
+func (l *Log) AppendTail(startIndex uint64, entries []*protos.LogEntry) {
 	if startIndex == 0 {
 		log.Fatalf("unable to append tail starting at 0")
 	}
@@ -45,14 +44,14 @@ func (l *Log) LastLogIndexAndTerm() (uint64, uint64) {
 	return index, e.Term
 }
 
-func (l *Log) Get(index uint64) Entry {
+func (l *Log) Get(index uint64) *protos.LogEntry {
 	if index == 0 {
-		return Entry{Term: 0, Command: nil}
+		return &protos.LogEntry{Term: 0, Command: nil}
 	}
 	return l.entries[index-1]
 }
 
-func (l *Log) GetTail(startIndex uint64) []Entry {
+func (l *Log) GetTail(startIndex uint64) []*protos.LogEntry {
 	if startIndex == 0 {
 		log.Fatal("unable to get tail starting at 0")
 	}

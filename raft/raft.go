@@ -345,7 +345,7 @@ func (h leaderProposeHandler) Execute(cur *machineState, rs *raftState, c *Clien
 	if !ok {
 		return nil, nil, nil
 	}
-	rs.log.Append(Entry{
+	rs.log.Append(&protos.LogEntry{
 		Term:    rs.term,
 		Command: req.cmd,
 	})
@@ -472,11 +472,7 @@ func (h appendEntriesHandler) Execute(cur *machineState, rs *raftState, c *Clien
 
 	success := rs.log.HasEntry(req.PrevLogIndex, req.PrevLogTerm)
 	if success {
-		var entries []Entry
-		for _, entry := range req.Entries {
-			entries = append(entries, Entry{Term: entry.Term, Command: entry.Command})
-		}
-		rs.log.AppendTail(req.PrevLogIndex+1, entries)
+		rs.log.AppendTail(req.PrevLogIndex+1, req.Entries)
 		rs.commitIndex = uint64Min(req.LeaderCommit, rs.log.LastLogIndex())
 		applyEntries(rs)
 	}
