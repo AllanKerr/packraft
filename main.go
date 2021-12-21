@@ -62,9 +62,12 @@ func main() {
 }
 
 func proposeLoop(rf *raft.Raft) {
+	i := 0
 	for {
 		time.Sleep(time.Second * 3)
-		rf.Propose(context.Background(), []byte{1, 1, 1, 1})
+		cmd := []byte(fmt.Sprintf("%v", i))
+		rf.Propose(context.Background(), cmd)
+		i += 1
 	}
 }
 
