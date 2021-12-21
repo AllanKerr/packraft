@@ -470,16 +470,21 @@ func (h appendEntriesHandler) Execute(cur *machineState, rs *raftState, c *Clien
 	rs.updateTerm(req.Term)
 	rs.resetTimeout(minElectionTimeoutTicks, maxElectionTimeoutTicks)
 
+	var conflictIndex, conflictTerm uint64
 	success := rs.log.HasEntry(req.PrevLogIndex, req.PrevLogTerm)
 	if success {
 		rs.log.AppendTail(req.PrevLogIndex+1, req.Entries)
 		rs.commitIndex = uint64Min(req.LeaderCommit, rs.log.LastLogIndex())
 		applyEntries(rs)
+	} else {
+		conflictIndex, conflictTerm = findConflictIndexAndTerm(rs.log, req.PrevLogIndex, req.PrevLogTerm)
 	}
 	return newFollowerState(), &protos.AppendEntriesResponse{
-		Term:         rs.term,
-		Success:      success,
-		LastLogIndex: rs.log.LastLogIndex(),
+		Term:          rs.term,
+		Success:       success,
+		LastLogIndex:  rs.log.LastLogIndex(),
+		ConflictIndex: conflictIndex,
+		ConflictTerm:  conflictTerm,
 	}, nil
 }
 
@@ -501,7 +506,7 @@ func (h appendEntriesResponseHandler) Execute(cur *machineState, rs *raftState, 
 		return cur
 	}
 	if !res.Success {
-		cur.nextIndex[serverID] = uint64Max(cur.nextIndex[serverID]-1, 1)
+		cur.nextIndex[serverID] = findNextIndex(rs.log, res.ConflictIndex, res.ConflictTerm)
 		return cur
 	}
 	cur.matchIndex[serverID] = uint64Max(cur.matchIndex[serverID], res.LastLogIndex)
@@ -526,19 +531,12 @@ func sendServerEntries(rs *raftState, c *Client, id uint32, nextIndex uint64) {
 	prevIndex := nextIndex - 1
 	prev := rs.log.Get(prevIndex)
 
-	var entries []*protos.LogEntry
-	for _, entry := range rs.log.GetTail(nextIndex) {
-		entries = append(entries, &protos.LogEntry{
-			Term:    entry.Term,
-			Command: entry.Command,
-		})
-	}
 	req := &protos.AppendEntriesRequest{
 		Term:         rs.term,
 		LeaderId:     rs.me,
 		PrevLogIndex: prevIndex,
 		PrevLogTerm:  prev.Term,
-		Entries:      entries,
+		Entries:      rs.log.GetTail(nextIndex),
 		LeaderCommit: rs.commitIndex,
 	}
 	c.AppendEntries(id, req, &protos.AppendEntriesResponse{})
@@ -553,6 +551,36 @@ func computeCommitIndex(matchIndex map[uint32]uint64) uint64 {
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 	majorityIndex := len(matchIndex) / 2
 	return sorted[majorityIndex]
+}
+
+func findConflictIndexAndTerm(log *Log, prevLogIndex uint64, prevLogTerm uint64) (uint64, uint64) {
+	if prevLogIndex >= log.NextLogIndex() {
+		return log.NextLogIndex(), 0
+	}
+	conflictIndex := prevLogIndex
+	conflictTerm := log.GetTerm(prevLogIndex)
+
+	for conflictIndex > 1 && log.GetTerm(conflictIndex) == conflictTerm {
+		conflictIndex--
+	}
+	return conflictIndex, conflictTerm
+}
+
+func findNextIndex(log *Log, conflictIndex uint64, conflictTerm uint64) uint64 {
+	if conflictTerm == 0 {
+		return conflictIndex
+	}
+	var lastIndexOfTerm uint64
+	for i := log.LastLogIndex(); i >= 1; i-- {
+		if log.GetTerm(i) == conflictTerm {
+			lastIndexOfTerm = i
+			break
+		}
+	}
+	if lastIndexOfTerm >= 1 {
+		return lastIndexOfTerm
+	}
+	return conflictIndex
 }
 
 func applyEntries(rs *raftState) {

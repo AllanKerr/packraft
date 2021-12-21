@@ -44,6 +44,14 @@ func (l *Log) LastLogIndexAndTerm() (uint64, uint64) {
 	return index, e.Term
 }
 
+func (l *Log) GetTerm(index uint64) uint64 {
+	if index == 0 {
+		return 0
+	}
+	e := l.Get(index)
+	return e.Term
+}
+
 func (l *Log) Get(index uint64) *protos.LogEntry {
 	if index == 0 {
 		return &protos.LogEntry{Term: 0, Command: nil}
